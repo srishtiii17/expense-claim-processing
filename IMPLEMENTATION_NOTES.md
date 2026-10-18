@@ -216,18 +216,7 @@ Full suite (`.\mvnw.cmd test`): **26 tests, 0 failures, 0 errors, 0 skipped — 
 13 new validation tests + 13 Checkpoint 1 tests. Flyway: `Successfully validated 1 migration`,
 `Schema "public" is up to date` (V1 unchanged, no new migration).
 
-### Notes from this step
 
-- **Stale environment variable:** the first full-suite run failed with `password authentication failed
-  for user "expense_app"`. The Claude Code session had started with an old copy of `DB_PASSWORD`; the
-  Windows user variable was already correct (direct `psql` login succeeded). A terminal or IDE opened
-  before a variable is changed keeps the old value. Fix: restart it.
-- **Stale incremental compile:** once, `target/classes` held a `CreateExpenseClaimRequest` without its
-  constructor and accessors, so test compilation failed with "cannot find symbol". `.\mvnw.cmd clean`
-  fixed it; the root cause was not identified. If an impossible "cannot find symbol" appears, run
-  `.\mvnw.cmd clean test`.
-- `@Size` counts Java `char`s, so an emoji counts as 2 while PostgreSQL counts it as 1. Java is
-  therefore slightly stricter than the column, never looser.
 
 ---
 
