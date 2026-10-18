@@ -182,7 +182,7 @@ class ExpenseClaimControllerTest {
 
     @Test
     void managerCannotSubmitAClaim() throws Exception {
-        // Mentor clarification C3: managers do not submit claims.
+        // Requirement C3: managers do not submit claims.
         signInAs(manager);
         long claimsBefore = expenseClaimRepository.count();
 

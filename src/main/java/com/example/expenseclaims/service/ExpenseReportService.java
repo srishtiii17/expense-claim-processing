@@ -17,7 +17,7 @@ import java.time.YearMonth;
 import java.util.List;
 
 /**
- * Reports over approved claims (mentor clarification C2: only APPROVED claims count).
+ * Reports over approved claims (requirement C2: only APPROVED claims count).
  *
  * "This month" is the calendar month of today's date in the server's time zone (assumption A6,
  * open question 5). The Clock is injected so tests can fix "today".

@@ -22,7 +22,7 @@ Main capabilities:
 - Every role can list and filter the claims it is allowed to see, page by page.
 - Managers and finance get a monthly report of approved totals per category, calculated in the database.
 
-The approval workflow is **single-stage**, as confirmed by the mentor: `SUBMITTED → APPROVED` or
+The approval workflow is **single-stage manager approval**: `SUBMITTED → APPROVED` or
 `SUBMITTED → REJECTED`, and the manager's decision is final.
 
 ---
@@ -437,7 +437,7 @@ All errors return `application/problem+json`, for example:
 
 ## 14. Assumptions and Limitations
 
-Confirmed by the mentor:
+Confirmed requirements (C1–C3 in `IMPLEMENTATION_NOTES.md`):
 
 - **Single-stage approval:** the manager's decision is final, and there is no finance approval stage (C1).
 - Monthly totals include **`APPROVED`** claims only (C2).
@@ -463,7 +463,8 @@ Known limitations:
 - List sorting is fixed: newest first, and pending approvals oldest first.
 - No logout, token revocation, refresh tokens, login rate limiting or account lockout. Login emails are
   case-sensitive.
-- The open questions for the mentor are listed at the end of `IMPLEMENTATION_NOTES.md`.
+- Items still requiring requirements confirmation are listed under "Open questions" at the end of
+  `IMPLEMENTATION_NOTES.md`.
 
 ---
 

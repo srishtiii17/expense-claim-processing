@@ -62,15 +62,15 @@ defaults are used (port 5432, PostgreSQL 18).
 
 ---
 
-## Mentor clarifications (confirmed 2026-10-16)
+## Confirmed requirements (2026-10-16)
 
-| # | Clarification | Replaces | Code impact |
+| # | Requirement | Replaces | Code impact |
 |---|---|---|---|
 | C1 | **Manager approval is the final approval.** A claim goes `SUBMITTED → APPROVED` or `SUBMITTED → REJECTED`, decided by the manager. There is no second (finance) approval stage. | A1 | **Done (2026-10-16):** `ClaimStatus` now has only `SUBMITTED`, `APPROVED`, `REJECTED` (Javadoc updated); the `ck_expense_claims_status` CHECK in `V1__create_initial_tables.sql` allows only those three values; `ExpenseClaimRepositoryTest.versionIncreasesWhenClaimIsUpdated` uses `APPROVED`. V1 was edited in place because it had never been applied to any database (every connection attempt failed authentication), so there is no Flyway checksum conflict. |
 | C2 | **Monthly totals include `APPROVED` claims only.** | Confirms the status part of A6 | None; matches A6. |
 | C3 | **Managers do not need to submit their own claims.** | A2 (submission part); resolves open question 3 | **Done (Checkpoint 2 part 2):** `ExpenseClaimService.submitClaim` allows only the `EMPLOYEE` role; `MANAGER` (and `FINANCE`, see A9) get HTTP 403. |
 
-## Business-rule assumptions (not yet confirmed by mentor)
+## Business-rule assumptions (not yet confirmed)
 
 | # | Assumption | Where it shows up in code |
 |---|---|---|
@@ -549,7 +549,7 @@ version check deterministically.
 - No resubmission or editing of rejected claims (A5).
 - No database-level "one decision per claim" constraint; it is enforced by the status check plus
   optimistic locking. A partial unique index on `approval_comments(claim_id)` for `APPROVE`/`REJECT`
-  could be added in a new migration if the mentor wants a second safeguard.
+  could be added in a new migration if a second safeguard is required.
 
 (Checkpoint 5 below adds the pending-approval list and the report.)
 
@@ -667,7 +667,10 @@ Example response:
 
 ---
 
-## Open mentor questions
+## Open questions (items requiring requirements confirmation)
+
+These design decisions are still unresolved; the current behaviour for each is the assumption noted.
+Other sections refer to them as "open question N".
 
 1. ~~Approval stages~~ answered by C1. Still open: finance's exact powers. Read-only reporting only, or anything else? (A3)
 2. Resubmission or editing of claims (current assumption: A5).

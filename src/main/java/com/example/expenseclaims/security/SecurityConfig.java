@@ -33,7 +33,7 @@ import java.util.Objects;
  * - Stateless: no HTTP session and no cookies. Every request must carry "Authorization: Bearer <token>".
  * - Public: only POST /api/auth/login (and Spring's internal /error page).
  * - Everything else requires a valid token. New routes are protected automatically.
- * - Role rules: only EMPLOYEE may submit claims (mentor clarification C3, assumption A9); only
+ * - Role rules: only EMPLOYEE may submit claims (requirement C3, assumption A9); only
  *   MANAGER may approve or reject them (Checkpoint 4) or list pending approvals; only MANAGER and
  *   FINANCE may read reports (Checkpoint 5). These checks run in the security filter, before the
  *   request is read or validated. The services check the same rules again.

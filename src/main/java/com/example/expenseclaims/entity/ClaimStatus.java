@@ -1,7 +1,7 @@
 package com.example.expenseclaims.entity;
 
 /**
- * The lifecycle of an expense claim (single-stage approval, confirmed by mentor):
+ * The lifecycle of an expense claim (single-stage manager approval, requirement C1):
  *
  * SUBMITTED -> APPROVED
  * SUBMITTED -> REJECTED

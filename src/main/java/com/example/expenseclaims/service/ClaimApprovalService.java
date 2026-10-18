@@ -18,7 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.Objects;
 
 /**
- * The manager approval workflow (single stage, mentor clarification C1):
+ * The manager approval workflow (single stage, requirement C1):
  *
  *   SUBMITTED -> APPROVED   (comment optional)
  *   SUBMITTED -> REJECTED   (comment required)

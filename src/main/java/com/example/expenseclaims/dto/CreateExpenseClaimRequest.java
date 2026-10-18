@@ -33,7 +33,7 @@ public record CreateExpenseClaimRequest(
         BigDecimal amount,
 
         // "Today" is the current date in the server's default time zone (assumption A4;
-        // the company time zone is an open mentor question).
+        // the company time zone is an open design decision).
         @NotNull(message = "expenseDate is required")
         @PastOrPresent(message = "expenseDate cannot be in the future")
         LocalDate expenseDate,
