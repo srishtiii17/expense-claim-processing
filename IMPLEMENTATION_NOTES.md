@@ -66,7 +66,7 @@ defaults are used (port 5432, PostgreSQL 18).
 | ~~A1~~ | Withdrawn. Replaced by C1 (single-stage approval); no code still uses it. | — |
 | A2 | Managers view their department's claims and approve or reject them (submission part superseded by C3) | Checkpoints 3–4 |
 | A3 | Finance can view claims across all departments (read-only, because of C1; exact finance powers still open) | Checkpoints 3–5 |
-| A4 | Expense date cannot be in the future; no maximum age | Checkpoint 2 |
+| A4 | Expense date cannot be in the future; no maximum age. "Today" is the date in the **server's default time zone** (open question 5) | `@PastOrPresent` on `CreateExpenseClaimRequest.expenseDate` |
 | A5 | Rejection requires a comment; rejected claims are final; no resubmission in v1 | Checkpoint 4 |
 | A6 | Monthly totals are grouped by `expense_date` for the current calendar month (the `APPROVED`-only part is confirmed by C2) | Checkpoint 5 |
 | A7 | Categories are a fixed list: TRAVEL, MEALS, ACCOMMODATION, OFFICE_SUPPLIES, TRAINING, OTHER | `ExpenseCategory` enum + DB CHECK |
@@ -96,7 +96,7 @@ but never changes the schema); `open-in-view=false`.
 
 **DTOs (records):** `EmployeeSummaryResponse` (no email or password hash),
 `ExpenseClaimResponse`, `ApprovalCommentResponse`, `CreateExpenseClaimRequest`
-(no owner, id or status fields). No validation annotations yet (Checkpoint 2).
+(no owner, id or status fields). Validation annotations were added in Checkpoint 2.
 
 **Not included on purpose:** controllers, services, validation and security dependencies.
 They belong to Checkpoints 2–3.
@@ -167,6 +167,51 @@ Not covered by a test: there is no test that tries to insert a removed or invali
   POMs (`flyway-community-db-support`, Red Gate `MavenFeed`). Dependencies resolve from
   Maven Central; the build is not affected.
 - Entities do not override `equals`/`hashCode`; they are compared by id where needed.
+
+---
+
+## Checkpoint 2 (part 1) — request validation
+
+### What changed (2026-10-18)
+
+- `pom.xml`: added `spring-boot-starter-validation` (Hibernate Validator; version managed by the
+  Spring Boot parent).
+- `CreateExpenseClaimRequest`: validation annotations that mirror the V1 columns. No schema change;
+  V1 was not touched.
+
+| Field | Annotations | Matches database |
+|---|---|---|
+| `category` | `@NotNull` | `category ... NOT NULL` + category CHECK |
+| `amount` | `@NotNull`, `@Positive`, `@Digits(integer = 10, fraction = 2)` | `NUMERIC(12, 2) NOT NULL`, `CHECK (amount > 0)` |
+| `expenseDate` | `@NotNull`, `@PastOrPresent` | `expense_date DATE NOT NULL`; the "no future date" rule exists only in Java (A4) |
+| `description` | `@Size(max = 500)` (optional, `null` allowed) | `VARCHAR(500)`, nullable |
+
+- New test class `CreateExpenseClaimRequestValidationTest` (13 plain unit tests, no Spring, no
+  database). It uses a fixed clock (2026-10-18, UTC) so the future-date test cannot fail by chance
+  at midnight.
+
+**Not done yet:** nothing calls the validator outside the tests. The annotations take effect once a
+controller method receives the request with `@Valid` (next Checkpoint 2 step), together with an
+error handler that turns violations into a clear 400 response.
+
+### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6)
+
+Full suite (`.\mvnw.cmd test`): **26 tests, 0 failures, 0 errors, 0 skipped — BUILD SUCCESS.**
+13 new validation tests + 13 Checkpoint 1 tests. Flyway: `Successfully validated 1 migration`,
+`Schema "public" is up to date` (V1 unchanged, no new migration).
+
+### Notes from this step
+
+- **Stale environment variable:** the first full-suite run failed with `password authentication failed
+  for user "expense_app"`. The Claude Code session had started with an old copy of `DB_PASSWORD`; the
+  Windows user variable was already correct (direct `psql` login succeeded). A terminal or IDE opened
+  before a variable is changed keeps the old value. Fix: restart it.
+- **Stale incremental compile:** once, `target/classes` held a `CreateExpenseClaimRequest` without its
+  constructor and accessors, so test compilation failed with "cannot find symbol". `.\mvnw.cmd clean`
+  fixed it; the root cause was not identified. If an impossible "cannot find symbol" appears, run
+  `.\mvnw.cmd clean test`.
+- `@Size` counts Java `char`s, so an emoji counts as 2 while PostgreSQL counts it as 1. Java is
+  therefore slightly stricter than the column, never looser.
 
 ---
 
