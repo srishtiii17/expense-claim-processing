@@ -75,17 +75,19 @@ defaults are used (port 5432, PostgreSQL 18).
 | # | Assumption | Where it shows up in code |
 |---|---|---|
 | ~~A1~~ | Withdrawn. Replaced by C1 (single-stage approval); no code still uses it. | — |
-| A2 | Managers approve or reject claims from their own department (**done, Checkpoint 4**) and view their department's claims (Checkpoint 5). Submission part superseded by C3 | `ClaimApprovalService` |
-| A3 | Finance can view claims across all departments (read-only, because of C1; exact finance powers still open) | Checkpoints 3–5 |
+| A2 | Managers approve or reject claims from their own department (**done, Checkpoint 4**), and see their whole department's claims, pending queue and monthly report (**done, Checkpoint 5**). Submission part superseded by C3 | `ClaimApprovalService`, `ClaimSpecifications.visibleTo` |
+| A3 | Finance can read claims across all departments and the organisation-wide monthly report, read-only (**done, Checkpoint 5**); no write powers. Exact finance powers still an open question | `ClaimSpecifications.visibleTo`, `ExpenseReportService` |
 | A4 | Expense date cannot be in the future; no maximum age. "Today" is the date in the **server's default time zone** (open question 5) | `@PastOrPresent` on `CreateExpenseClaimRequest.expenseDate` |
 | A5 | Rejection requires a nonblank comment; approval comment optional; APPROVED and REJECTED are final; no resubmission or editing in v1 | `RejectClaimRequest`, `ClaimApprovalService` |
-| A6 | Monthly totals are grouped by `expense_date` for the current calendar month (the `APPROVED`-only part is confirmed by C2) | Checkpoint 5 |
+| A6 | Monthly totals are grouped by `expense_date` for the current calendar month, `[1st of month, 1st of next month)`, in the server's default time zone (the `APPROVED`-only part is confirmed by C2) | `ExpenseReportService`, `ClockConfig` |
 | A7 | Categories are a fixed list: TRAVEL, MEALS, ACCOMMODATION, OFFICE_SUPPLIES, TRAINING, OTHER | `ExpenseCategory` enum + DB CHECK |
 | A8 | Amount is stored as `NUMERIC(12,2)`; single currency; no upper limit | `ExpenseClaim.amount`, V1 migration |
 | A9 | Only the `EMPLOYEE` role submits claims. C3 rules out managers; finance users are assumed not to submit either | `ExpenseClaimService.submitClaim` |
-| A10 | `GET /api/claims/{id}` shows a claim only to its owner. Another employee's claim answers 404 (not 403), so claim ids cannot be probed. The same 404 rule applies to a manager deciding a claim from another department | `ExpenseClaimService.getClaim`, `ClaimApprovalService` |
+| A10 | A claim the caller may not see answers 404 (not 403), so claim ids cannot be probed. Since Checkpoint 5, `GET /api/claims/{id}` uses the same visibility as the list (employee: own; manager: own department; finance: all). The same 404 rule applies to a manager deciding a claim from another department | `ExpenseClaimService.getClaim`, `ClaimApprovalService` |
 | A11 | Nobody may approve or reject their own claim (possible only for a claim submitted before a promotion to manager) | `ClaimApprovalService` |
 | A12 | Any manager of the claim owner's department may decide it; there is no "assigned approver" or direct-report hierarchy (question 7) | `ClaimApprovalService` |
+| A13 | A manager's pending-approval list leaves out their own SUBMITTED claims, because they may not decide them (A11). Those claims still appear in `GET /api/claims` | `ClaimSpecifications.pendingApprovalFor` |
+| A14 | Filter ranges are inclusive at both ends; enum values are case-sensitive (`TRAVEL`, not `travel`); dates are ISO `yyyy-MM-dd` | `ClaimSearchCriteria`, `ExpenseClaimController` |
 
 ---
 
@@ -549,6 +551,120 @@ version check deterministically.
   optimistic locking. A partial unique index on `approval_comments(claim_id)` for `APPROVE`/`REJECT`
   could be added in a new migration if the mentor wants a second safeguard.
 
+(Checkpoint 5 below adds the pending-approval list and the report.)
+
+---
+
+## Checkpoint 5 — pending approvals, dynamic filtering, monthly aggregation
+
+### Summary (2026-10-18)
+
+Three read-only endpoints, plus a visibility change to `GET /api/claims/{id}`. **No schema change, no new
+migration, no new dependencies.** Existing indexes cover the queries: `expense_claims(status, employee_id)`,
+`expense_claims(employee_id)`, `expense_claims(expense_date)`, `employees(department_id)`.
+
+### Endpoints
+
+| Method and path | Roles | Returns |
+|---|---|---|
+| `GET /api/claims?status=&category=&minAmount=&maxAmount=&startDate=&endDate=&page=&size=` | any authenticated | `PageResponse<ExpenseClaimResponse>`, newest first |
+| `GET /api/claims/pending-approvals?page=&size=` | MANAGER | `PageResponse<ExpenseClaimResponse>`, oldest first |
+| `GET /api/reports/monthly-expenses-by-category` | MANAGER, FINANCE | `MonthlyCategoryReportResponse` |
+| `GET /api/claims/{id}` (changed) | any authenticated | now uses the same visibility as the list |
+
+`PageResponse` = `{"content": [...], "page", "size", "totalElements", "totalPages"}`. `page` starts at 0
+(default 0), `size` 1–100 (default 20). Out-of-range values give 400.
+
+### Visibility (who sees which claims)
+
+One rule, `ClaimSpecifications.visibleTo(caller)`, used by the list, the detail endpoint, and as the base of
+every search:
+
+| Caller role | Sees |
+|---|---|
+| EMPLOYEE | own claims only |
+| MANAGER | every claim whose owner is in the manager's department (including the manager's own) |
+| FINANCE | all claims, all departments (read-only: finance has no write endpoints) |
+
+The caller, their role and their department come from the database row of the employee in the verified JWT.
+There is no `employeeId` or `departmentId` parameter; if a client sends one, it is ignored (tested).
+Filters are added with `AND`, so they can only narrow what the caller may see.
+
+### Dynamic filtering
+
+- `ClaimSearchCriteria` holds the six optional filters. Its constructor rejects `minAmount > maxAmount` and
+  `startDate > endDate` (`InvalidFilterException` → 400 "Invalid request" with a plain message).
+  Equal bounds are allowed. Ranges are inclusive (A14).
+- `ClaimSpecifications.matching(criteria)` builds one JPA Criteria predicate with only the filters that
+  were given. `ExpenseClaimRepository` extends `JpaSpecificationExecutor`, so one `findAll(spec, pageable)`
+  covers every combination; there are no per-combination repository methods. Values are bind parameters.
+- Invalid values (`status=PENDING`, `category=travel`, `startDate=2026-13-01`, `minAmount=abc`, `size=0`)
+  are rejected by Spring's type conversion or method validation and answered by the existing
+  `ApiExceptionHandler` as 400 problem details without class names.
+
+### Pending approvals
+
+`ClaimSpecifications.pendingApprovalFor(manager)`: `status = SUBMITTED`, owner's department = manager's
+department, owner ≠ manager (A13). Sorted oldest first (`createdAt`, then `id`). Deciding a claim removes it
+from the list (tested). Approve/reject rules from Checkpoint 4 are unchanged.
+
+### N+1 prevention
+
+`ExpenseClaimRepository.findAll(Specification, Pageable)` is overridden with
+`@EntityGraph(attributePaths = {"employee", "employee.department"})`, so the claims, their owners and
+departments come back in one SQL query (the count query is unaffected). A test clears the persistence
+context, enables Hibernate statistics and checks that listing 6 claims from 3 owners in 2 departments takes
+at most 2 statements (caller lookup + one claims query). With the entity graph removed, this test fails
+(checked).
+
+### Monthly aggregation
+
+- JPQL aggregate queries in `ExpenseClaimRepository` (`sumApprovedAmountsByCategory` and
+  `...ForDepartment`): `SELECT new CategoryTotal(c.category, SUM(c.amount)) ... WHERE status = APPROVED AND
+  expenseDate >= :start AND expenseDate < :end [AND c.employee.department.id = :departmentId]
+  GROUP BY c.category ORDER BY c.category`. Hibernate translates this to SQL `SUM ... GROUP BY`, so
+  PostgreSQL does the aggregation and returns one row per category. All values are bind parameters.
+  (JPQL was chosen over a native query because it is checked against the entity model at startup and uses
+  the enum types directly.)
+- Period: `YearMonth.now(clock)` → `[1st of month, 1st of next month)`. `Clock` is a bean (`ClockConfig`,
+  system default zone, A6) so tests can fix "today".
+- FINANCE: `scope = "ORGANIZATION"`, `departmentName = null`. MANAGER: `scope = "DEPARTMENT"`, own department
+  only. EMPLOYEE: 403 (URL rule + service check).
+- Categories with no approved claims are left out; no data gives `"totals": []` and `"grandTotal": 0.00`.
+  `grandTotal` adds up the (at most six) category totals returned by the database.
+- A test checks the report runs at most 2 statements and loads **zero** `ExpenseClaim` entities.
+
+Example response:
+```json
+{"month": "2025-02", "periodStart": "2025-02-01", "periodEndExclusive": "2025-03-01",
+ "scope": "DEPARTMENT", "departmentName": "Sales",
+ "totals": [{"category": "MEALS", "total": 30.00}, {"category": "TRAVEL", "total": 150.25}],
+ "grandTotal": 180.25}
+```
+
+### Tests added (40)
+
+| Class | Tests | Covers |
+|---|---|---|
+| `web.ClaimSearchControllerTest` | 27 | No-filter visibility for employee, both managers and finance; DTO shape; each filter alone (status, category, min/max amount inclusive, start/end date inclusive); all filters combined (as finance and as a manager who sees none); amount + date ranges; equal bounds; filters never widen employee or manager views; `employeeId`/`departmentId` parameters ignored; min > max and start > end → 400 with message; invalid enums (wrong value, wrong case), malformed dates/amounts, invalid paging → 400 without internal details; paging; no token → 401; `GET /{id}` for manager (own department 200, other 404), finance (any 200), employee (colleague 404); N+1 statement count |
+| `web.PendingApprovalsControllerTest` | 6 | Only SUBMITTED claims of the manager's department, oldest first, excluding approved/rejected, other departments and the manager's own claim; empty department → empty page; decided claims leave the list; paging and size limit; `departmentId` ignored; employee and finance 403, no token 401 |
+| `web.MonthlyReportControllerTest` | 7 | Fixed clock 2025-02-15: finance organisation-wide totals per category; manager department totals (two departments); first and last day of the month included, previous/next month excluded, SUBMITTED/REJECTED excluded; empty month; manager with no approved claims; employee 403, no token 401; `departmentId`/`scope` parameters ignored; aggregation in the database (≤ 2 statements, 0 claim entities loaded). Changing `< :end` to `<= :end` makes 3 of these fail (checked) |
+
+### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6, `expense_claims_test`)
+
+`.\mvnw.cmd test` (after `.\mvnw.cmd clean`): **146 tests, 0 failures, 0 errors, 0 skipped — BUILD SUCCESS**
+(106 earlier + 27 + 6 + 7). No existing test was changed.
+
+### Not done / open questions
+
+- **Month and time zone:** only the current month, in the server's default time zone (question 5). No
+  `?month=` parameter yet.
+- **Manager scope:** whole department, not direct reports (question 7).
+- **Report viewers:** managers (own department) and finance (all) can see it; employees cannot (question 8).
+- **No sorting parameter:** list order is fixed (newest first; pending oldest first).
+- The `departmentName` field is `null` in the organisation-wide report (Jackson writes `"departmentName": null`).
+- Audit trail reading, plain comments and resubmission remain open (see Checkpoint 4).
+
 ---
 
 ## Open mentor questions
@@ -560,7 +676,8 @@ version check deterministically.
 5. Time zone used for "today" and "current month" (server default vs company zone).
 6. Category list and any amount limit or currency (A7, A8).
 7. Does a manager see the whole department or only direct reports?
-8. Who may view the monthly report (assumed: finance)?
+8. Who may view the monthly report? (Current: finance organisation-wide, managers their own department,
+   employees not at all.)
 9. Is a real PostgreSQL test database acceptable, or are H2 tests expected?
 10. Are JDK 25 and Spring Boot 4.1.1 acceptable?
 11. How are users created (seed data vs registration), token lifetime, refresh tokens? (Current: created

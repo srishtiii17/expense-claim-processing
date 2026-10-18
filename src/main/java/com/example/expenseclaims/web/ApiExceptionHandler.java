@@ -7,6 +7,7 @@ import com.example.expenseclaims.service.ClaimSubmissionNotAllowedException;
 import com.example.expenseclaims.service.EmployeeNotFoundException;
 import com.example.expenseclaims.service.InvalidClaimStateException;
 import com.example.expenseclaims.service.InvalidCredentialsException;
+import com.example.expenseclaims.service.InvalidFilterException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.OptimisticLockingFailureException;
@@ -57,6 +58,12 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         problem.setTitle("Invalid request");
         problem.setProperty("errors", errors);
         return handleExceptionInternal(ex, problem, headers, HttpStatus.BAD_REQUEST, request);
+    }
+
+    // Contradictory search filters, for example minAmount greater than maxAmount.
+    @ExceptionHandler(InvalidFilterException.class)
+    public ProblemDetail handleInvalidFilter(InvalidFilterException ex) {
+        return problem(HttpStatus.BAD_REQUEST, "Invalid request", ex.getMessage());
     }
 
     @ExceptionHandler({ClaimNotFoundException.class, EmployeeNotFoundException.class})

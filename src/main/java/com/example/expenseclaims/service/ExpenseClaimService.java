@@ -1,17 +1,23 @@
 package com.example.expenseclaims.service;
 
+import com.example.expenseclaims.dto.ClaimSearchCriteria;
 import com.example.expenseclaims.dto.CreateExpenseClaimRequest;
 import com.example.expenseclaims.dto.ExpenseClaimResponse;
+import com.example.expenseclaims.dto.PageResponse;
 import com.example.expenseclaims.entity.Employee;
 import com.example.expenseclaims.entity.ExpenseClaim;
 import com.example.expenseclaims.entity.Role;
+import com.example.expenseclaims.repository.ClaimSpecifications;
 import com.example.expenseclaims.repository.EmployeeRepository;
 import com.example.expenseclaims.repository.ExpenseClaimRepository;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
-import java.util.Objects;
 
 /**
  * Business logic for submitting and reading expense claims.
@@ -55,15 +61,48 @@ public class ExpenseClaimService {
     }
 
     /**
-     * Returns one claim if it belongs to the given employee.
-     * Only the owner can see a claim here. Department views for managers and finance reporting are
-     * planned for Checkpoint 5 (assumptions A2, A3, A10).
+     * Returns one claim if the caller may see it (same rule as searchClaims: employees their own,
+     * managers their department's, finance all). A claim the caller may not see answers 404, exactly
+     * like a missing one, so claim ids cannot be probed (A10).
      */
     public ExpenseClaimResponse getClaim(Long employeeId, Long claimId) {
-        ExpenseClaim claim = expenseClaimRepository.findById(claimId)
-                .filter(found -> Objects.equals(found.getEmployee().getId(), employeeId))
+        Employee caller = findEmployee(employeeId);
+        ExpenseClaim claim = expenseClaimRepository
+                .findOne(ClaimSpecifications.visibleTo(caller).and(ClaimSpecifications.hasId(claimId)))
                 .orElseThrow(() -> new ClaimNotFoundException(claimId));
         return ExpenseClaimResponse.fromEntity(claim);
+    }
+
+    /**
+     * GET /api/claims: the claims the caller may see, narrowed by optional filters, newest first.
+     * The visibility rule always applies; filters can only narrow it further.
+     */
+    public PageResponse<ExpenseClaimResponse> searchClaims(Long employeeId, ClaimSearchCriteria criteria,
+                                                           int page, int size) {
+        Employee caller = findEmployee(employeeId);
+        Specification<ExpenseClaim> specification =
+                ClaimSpecifications.visibleTo(caller).and(ClaimSpecifications.matching(criteria));
+        PageRequest pageRequest = PageRequest.of(page, size,
+                Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id")));
+        return PageResponse.from(expenseClaimRepository.findAll(specification, pageRequest),
+                ExpenseClaimResponse::fromEntity);
+    }
+
+    /**
+     * GET /api/claims/pending-approvals: SUBMITTED claims from the manager's own department that the
+     * manager may decide (their own claims are left out), oldest first so the queue is worked in order.
+     */
+    public PageResponse<ExpenseClaimResponse> getPendingApprovals(Long managerId, int page, int size) {
+        Employee manager = findEmployee(managerId);
+        // The URL rule in SecurityConfig already refuses other roles; this protects non-HTTP callers.
+        if (manager.getRole() != Role.MANAGER) {
+            throw new AccessDeniedException("Only managers have a pending-approval list");
+        }
+        PageRequest pageRequest = PageRequest.of(page, size,
+                Sort.by(Sort.Order.asc("createdAt"), Sort.Order.asc("id")));
+        return PageResponse.from(
+                expenseClaimRepository.findAll(ClaimSpecifications.pendingApprovalFor(manager), pageRequest),
+                ExpenseClaimResponse::fromEntity);
     }
 
     /**
