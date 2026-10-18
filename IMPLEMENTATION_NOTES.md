@@ -43,6 +43,17 @@ defaults are used (port 5432, PostgreSQL 18).
    | `DB_PASSWORD` | yes | none |
    | `DB_URL` | no | `jdbc:postgresql://localhost:5432/expense_claims` |
    | `TEST_DB_URL` | no | `jdbc:postgresql://localhost:5432/expense_claims_test` |
+   | `JWT_SECRET` | yes, to **run** the app (tests generate their own) | none: startup fails without it |
+   | `JWT_EXPIRY` | no | `1h` |
+
+   Generate `JWT_SECRET` once with a cryptographic random generator (PowerShell, prints nothing):
+   ```powershell
+   $bytes = New-Object byte[] 48
+   [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+   [Environment]::SetEnvironmentVariable('JWT_SECRET', [Convert]::ToBase64String($bytes), 'User')
+   ```
+   Then open a **new** terminal or IDE (already-open ones keep the old environment).
+   Changing `JWT_SECRET` invalidates every token issued with the old value.
 
 4. Run the tests: `.\mvnw.cmd test`
 
@@ -218,12 +229,11 @@ Full suite (`.\mvnw.cmd test`): **26 tests, 0 failures, 0 errors, 0 skipped — 
 
 ## Checkpoint 2 (part 2) — claim submission and retrieval
 
-### Authentication status — read this first
+### Authentication status at the time of part 2 (superseded by Checkpoint 3)
 
-**Authentication and authorization are NOT implemented. They are scheduled for Checkpoint 3.**
-The production application has no login, so it cannot know who is calling. Instead of trusting an
-employee id sent by the caller, every claim endpoint currently answers **HTTP 401** in the running
-application. The endpoints are fully exercised by tests, which supply an identity from test-only code.
+At this point authentication was not implemented: every claim endpoint answered **HTTP 401** in the
+running application, and tests supplied an identity from test-only code. Checkpoint 3 replaced
+`UnauthenticatedCurrentEmployeeProvider` and the test-only provider with JWT authentication (see below).
 
 ### What was implemented (2026-10-18)
 
@@ -292,6 +302,146 @@ All tests use the `test` profile and `expense_claims_test`, and roll back their 
 - "My claims" has no paging or filtering yet.
 - MockMvc exercises the full Spring MVC stack without starting a real HTTP server.
 
+(The first four points are resolved or changed by Checkpoint 3, below.)
+
+---
+
+## Checkpoint 3 — JWT authentication and role-based authorization
+
+### Summary (2026-10-18)
+
+Login with email and password returns a signed JWT. Every route except login requires
+`Authorization: Bearer <token>`. Spring Security verifies the token, loads the employee and their
+role from the database, and enforces the role rules. **Authentication is implemented; authorization
+is implemented only for the endpoints that exist.** Manager/finance views and approvals are later
+checkpoints (see "Not done yet").
+
+No schema change and no new migration: `employees.password_hash VARCHAR(100)` already fits a
+60-character BCrypt hash. There is no "disabled account" column, so only deleted accounts are handled.
+
+### Dependencies added
+
+| Dependency | Scope | Why |
+|---|---|---|
+| `spring-boot-starter-security-oauth2-resource-server` | compile | Spring Security, bearer-token filter, JWT encode/decode via Nimbus JOSE+JWT. Versions managed by the Spring Boot 4.1.1 parent (Spring Security 7.1.1) |
+| `spring-boot-starter-security-oauth2-resource-server-test` | test | Spring Security test support for MockMvc |
+
+No separate JWT library was added.
+
+### Login
+
+`POST /api/auth/login` (public). Body `{"email", "password"}`; both required, password at most 72
+characters (BCrypt ignores anything after 72 bytes).
+
+1. `EmployeeRepository.findByEmail` (exact match; see open questions).
+2. `BCryptPasswordEncoder.matches(password, password_hash)`. When the email is unknown, the password is
+   still checked against a dummy hash, so the response time does not reveal which emails exist.
+3. Unknown email and wrong password give the **same** 401 body:
+   `{"title": "Authentication failed", "status": 401, "detail": "Invalid email or password."}`.
+4. Success: 200 with `Cache-Control: no-store` and
+   `{"accessToken", "tokenType": "Bearer", "expiresIn" (seconds), "expiresAt", "employee": {id, fullName, departmentName}, "role"}`.
+
+There is no registration endpoint and no seed user. To create a user, insert an `employees` row whose
+`password_hash` is a BCrypt hash. Generate one with the project's own library (tested 2026-10-18):
+```powershell
+.\mvnw.cmd -q dependency:build-classpath "-Dmdep.outputFile=target\classpath.txt"
+jshell --class-path (Get-Content target\classpath.txt -Raw).Trim()
+jshell> new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder().encode("the-password")
+```
+The password is visible on screen while you type it, so do this privately.
+
+### JWT design
+
+| Item | Decision |
+|---|---|
+| Algorithm | HS256 (HMAC-SHA256) with `JWT_SECRET` (at least 32 bytes). The decoder accepts **only** HS256, so `alg: none` and other algorithms are rejected |
+| Claims | `iss` = `expense-claims`, `sub` = employee id, `iat`, `exp`. Nothing else |
+| Role | **Not in the token.** Loaded from the database on every request (`EmployeeJwtAuthenticationConverter`). A role change applies immediately, and a role added to a token is ignored (tested) |
+| Lifetime | `JWT_EXPIRY`, default **1 hour**. No refresh tokens: after expiry the client logs in again |
+| Checks on every request | Signature, `exp` present and not expired, `nbf`, `iss` matches, `sub` present and numeric, employee still exists. Clock tolerance: 60 seconds (Spring default) |
+| Failures | Missing, malformed, expired, tampered, wrong issuer, unknown key, unsigned, deleted employee: all the same 401 with `WWW-Authenticate: Bearer` and detail "A valid bearer token is required." |
+| Secret handling | `app.jwt.secret=${JWT_SECRET:}`. Missing or shorter than 32 bytes: the app **refuses to start** with a clear message that never includes the value (checked with a real startup). `JwtProperties`, `IssuedToken`, `LoginRequest` and `LoginResponse` hide secrets in `toString()` |
+| Tests | `application-test.properties` sets `app.jwt.secret=${random.value}${random.value}`: a new random secret per test context, nothing committed |
+| Logout / revocation | Not supported (stateless). A token stays valid until it expires unless the employee is deleted or `JWT_SECRET` changes |
+
+### Spring Security configuration (`SecurityConfig`)
+
+- Stateless: `SessionCreationPolicy.STATELESS`, no cookies, no form login, no HTTP Basic. CSRF protection
+  is disabled because there are no cookies for a browser to send automatically.
+- Spring Boot's default generated user and password are not created (checked in the test log).
+- 401/403 raised inside the security filters are passed to `ApiExceptionHandler` through
+  `SecurityProblemHandler`, so all errors use the same RFC 9457 format from one handler.
+- Security checks run **before** the request body is read: an anonymous invalid body gets 401, and a
+  manager's invalid body gets 403, not 400 (both tested).
+
+### Identity
+
+`JwtCurrentEmployeeProvider` replaced `UnauthenticatedCurrentEmployeeProvider`. It reads the employee id
+from the verified token in the security context and nothing else. Controller and service were unchanged.
+
+The test-only `TestCurrentEmployeeProvider` and `TestAuthenticationConfiguration` were **removed**. With
+Spring Security active, a request without a valid token is refused before any controller runs, so
+replacing the provider no longer had any effect. Tests now send real signed tokens instead.
+`ExpenseClaimControllerWithoutAuthenticationTest.productionUsesOnlyTheJwtIdentityProvider` checks that
+exactly one provider exists and that it is the JWT one.
+
+### Permissions
+
+| Endpoint | No/invalid token | EMPLOYEE | MANAGER | FINANCE |
+|---|---|---|---|---|
+| `POST /api/auth/login` | public | public | public | public |
+| `POST /api/claims` | 401 | 201 (own claim) | 403 | 403 |
+| `GET /api/claims/mine` | 401 | 200, own claims | 200, own claims (normally empty) | 200, own claims (normally empty) |
+| `GET /api/claims/{id}` | 401 | 200 if own, else 404 | 200 if own, else 404 | 200 if own, else 404 |
+| Any other path | 401 | 404 | 404 | 404 |
+
+The submit rule is enforced twice: by the URL rule `hasRole("EMPLOYEE")` (403 before the body is read)
+and by `ExpenseClaimService` (`ClaimSubmissionNotAllowedException`), so it also holds for future
+non-HTTP callers.
+
+### Changed test expectations (behaviour changed on purpose)
+
+| Test | Before | Now | Why |
+|---|---|---|---|
+| `ExpenseClaimControllerTest.managerCannotSubmitAClaim` | 403, detail "Users with the MANAGER role cannot submit expense claims" | 403, detail "You do not have permission to perform this action." | Now rejected by the security rule before the service runs |
+| `missingEmployeeReturns404AndSavesNothing` → `tokenForAMissingEmployeeReturns401AndSavesNothing` | 404 | 401 | A valid signature for a deleted employee is no longer a valid identity |
+
+All other assertions are unchanged; only the identity source moved from the test provider to real tokens.
+Mutation check: with the URL role rule removed, 4 tests in `RoleAuthorizationTest` failed as expected
+(the rule was restored afterwards).
+
+### Tests added
+
+| Class | Tests | Covers |
+|---|---|---|
+| `web.AuthControllerTest` | 8 | Login returns a verifiable token (sub, iss, 1h lifetime, no role/email claims) that works on a protected route; `no-store`; no password or hash in the response; BCrypt storage; identical 401 for wrong password and unknown email; a plain-text stored password never works; blank fields and >72 chars give 400; other auth routes are protected |
+| `security.JwtAuthenticationTest` | 12 | Valid token; missing, malformed, non-Bearer, expired, no `exp`, wrong issuer, non-numeric subject, unknown key, unsigned (`alg: none`), and edited-subject tokens all give the same generic 401; a token cannot read, list or create claims as another employee |
+| `security.RoleAuthorizationTest` | 9 | Employee 201; manager and finance 403 with nothing saved; manager's invalid body still 403; all roles list own claims; unknown route with a valid token is 404; role claim in token ignored; role in body ignored; database role change applies to an existing token |
+| `security.JwtPropertiesTest` | 5 | Startup fails without a secret or with a short one (value not in the message); valid secret works; expiry must be positive; `toString` hides the secret |
+| `service.ExpenseClaimServiceTest` | 2 | Service refuses manager/finance submission and unknown employees without the HTTP layer |
+| `web.ExpenseClaimControllerWithoutAuthenticationTest` | +4 (now 6) | Invalid body without a token is 401; `employeeId` query/header and role headers are not identities; unknown routes are protected; exactly one (JWT) identity provider |
+
+### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6, `expense_claims_test`)
+
+`.\mvnw.cmd clean test`: **86 tests, 0 failures, 0 errors, 0 skipped — BUILD SUCCESS.**
+The full console output contained no JWT, BCrypt hash, test password, database password or generated
+default password.
+
+### Not done yet / open policy questions
+
+- **Managers** cannot yet see department claims, pending approvals or approve/reject (Checkpoints 4–5).
+  Whether a manager sees the whole department or only direct reports is still open (question 7).
+- **Finance** read-only access to all claims and the monthly report are not implemented (Checkpoint 5,
+  A3). Finance currently has no extra powers.
+- **Email matching is case-sensitive** (`Ravi@Example.com` does not match `ravi@example.com`), like the
+  existing unique constraint. Decide whether to normalise emails.
+- **No login rate limiting or lockout.** Repeated password guessing is only slowed by BCrypt.
+- **No logout or token revocation**, no refresh tokens (question 11: tokens currently last 1 hour).
+- **No disabled/locked account flag** in the schema; adding one would need a new migration.
+- **No user management**: employees and their password hashes are created directly in the database.
+- A request to the public login route that carries an invalid bearer token is still rejected with 401
+  (Spring Security checks any token that is sent). Clients should not send a token to `/login`.
+
 ---
 
 ## Open mentor questions
@@ -306,5 +456,8 @@ All tests use the `test` profile and `expense_claims_test`, and roll back their 
 8. Who may view the monthly report (assumed: finance)?
 9. Is a real PostgreSQL test database acceptable, or are H2 tests expected?
 10. Are JDK 25 and Spring Boot 4.1.1 acceptable?
-11. How are users created (seed data vs registration), token lifetime, refresh tokens?
+11. How are users created (seed data vs registration), token lifetime, refresh tokens? (Current: created
+    directly in the database, 1-hour tokens, no refresh tokens.)
+13. Should finance users be able to submit their own expense claims? (Current assumption A9: no.)
+14. Should login emails be case-insensitive, and is login rate limiting or account lockout required?
 12. Required base package name (currently `com.example.expenseclaims`)?

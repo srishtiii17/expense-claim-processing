@@ -9,27 +9,31 @@ import com.example.expenseclaims.entity.Role;
 import com.example.expenseclaims.repository.DepartmentRepository;
 import com.example.expenseclaims.repository.EmployeeRepository;
 import com.example.expenseclaims.repository.ExpenseClaimRepository;
-import com.example.expenseclaims.security.TestAuthenticationConfiguration;
-import com.example.expenseclaims.security.TestCurrentEmployeeProvider;
+import com.example.expenseclaims.security.JwtTestTokens;
+import com.example.expenseclaims.security.JwtTokenService;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
-import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.context.WebApplicationContext;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.matchesPattern;
+import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -41,22 +45,30 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Tests the claim endpoints through the full stack: HTTP request -> controller -> validation ->
  * service -> repository -> PostgreSQL test database, and back as JSON.
  *
- * MockMvc sends requests without starting a real web server. @Transactional rolls back everything
- * each test writes, so tests do not affect each other. TestAuthenticationConfiguration replaces the
- * production identity provider (which always answers 401) with one each test controls.
+ * MockMvc sends requests without starting a real web server, but with the real Spring Security
+ * filters. @Transactional rolls back everything each test writes, so tests do not affect each other.
+ *
+ * signInAs(...) issues a real signed JWT for that employee (the same way login does), and every
+ * request below sends it as "Authorization: Bearer ...". No identity shortcut is used.
  */
 @SpringBootTest
-@AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Transactional
-@Import(TestAuthenticationConfiguration.class)
 class ExpenseClaimControllerTest {
 
     @Autowired
-    private MockMvc mockMvc;
+    private WebApplicationContext webApplicationContext;
 
     @Autowired
-    private TestCurrentEmployeeProvider currentEmployee;
+    private JwtTokenService jwtTokenService;
+
+    @Autowired
+    private JwtEncoder jwtEncoder;
+
+    private MockMvc mockMvc;
+
+    // The token sent with every request; null means "not signed in".
+    private String bearerToken;
 
     @Autowired
     private DepartmentRepository departmentRepository;
@@ -75,17 +87,30 @@ class ExpenseClaimControllerTest {
     private Employee manager;
 
     @BeforeEach
+    void setUpMockMvc() {
+        mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext)
+                .apply(springSecurity())
+                .defaultRequest(get("/").with(request -> {
+                    if (bearerToken != null) {
+                        request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer " + bearerToken);
+                    }
+                    return request;
+                }))
+                .build();
+    }
+
+    @BeforeEach
     void createEmployees() {
         Department sales = departmentRepository.save(new Department("Sales"));
         ravi = employeeRepository.save(new Employee("Ravi Kumar", "ravi@example.com", "hash", Role.EMPLOYEE, sales));
         priya = employeeRepository.save(new Employee("Priya Nair", "priya@example.com", "hash", Role.EMPLOYEE, sales));
         manager = employeeRepository.save(new Employee("Karan Shah", "karan@example.com", "hash", Role.MANAGER, sales));
-        currentEmployee.signInAs(ravi.getId());
+        signInAs(ravi);
     }
 
     @AfterEach
-    void signOut() {
-        currentEmployee.signOut();
+    void signOutAfterTest() {
+        signOut();
     }
 
     // ---- Submitting a claim ----
@@ -158,15 +183,16 @@ class ExpenseClaimControllerTest {
     @Test
     void managerCannotSubmitAClaim() throws Exception {
         // Mentor clarification C3: managers do not submit claims.
-        currentEmployee.signInAs(manager.getId());
+        signInAs(manager);
         long claimsBefore = expenseClaimRepository.count();
 
         mockMvc.perform(post("/api/claims")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(claimJson("TRAVEL", "50.00", LocalDate.now().minusDays(1), "Taxi")))
                 .andExpect(status().isForbidden())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
                 .andExpect(jsonPath("$.title").value("Not allowed"))
-                .andExpect(jsonPath("$.detail").value("Users with the MANAGER role cannot submit expense claims"));
+                .andExpect(jsonPath("$.detail").value("You do not have permission to perform this action."));
 
         assertThat(expenseClaimRepository.count()).isEqualTo(claimsBefore);
     }
@@ -246,10 +272,10 @@ class ExpenseClaimControllerTest {
         Long first = submitClaim(claimJson("MEALS", "20.00", LocalDate.now().minusDays(3), "Lunch"));
         Long second = submitClaim(claimJson("TRAVEL", "35.00", LocalDate.now().minusDays(2), "Train"));
 
-        currentEmployee.signInAs(priya.getId());
+        signInAs(priya);
         submitClaim(claimJson("TRAINING", "99.00", LocalDate.now().minusDays(1), "Priya's course"));
 
-        currentEmployee.signInAs(ravi.getId());
+        signInAs(ravi);
         mockMvc.perform(get("/api/claims/mine"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2))
@@ -278,10 +304,10 @@ class ExpenseClaimControllerTest {
     @Test
     void anotherEmployeesClaimReturns404() throws Exception {
         // Answering 404 rather than 403 means callers cannot find out which claim ids exist.
-        currentEmployee.signInAs(priya.getId());
+        signInAs(priya);
         Long priyasClaim = submitClaim(claimJson("TRAINING", "99.00", LocalDate.now().minusDays(1), "Course"));
 
-        currentEmployee.signInAs(ravi.getId());
+        signInAs(ravi);
         mockMvc.perform(get("/api/claims/{id}", priyasClaim))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.detail").value("Expense claim " + priyasClaim + " was not found"));
@@ -297,25 +323,28 @@ class ExpenseClaimControllerTest {
     }
 
     @Test
-    void missingEmployeeReturns404AndSavesNothing() throws Exception {
-        currentEmployee.signInAs(Long.MAX_VALUE);
+    void tokenForAMissingEmployeeReturns401AndSavesNothing() throws Exception {
+        // Correctly signed, but the employee does not exist (for example, deleted after login).
+        Instant now = Instant.now();
+        bearerToken = JwtTestTokens.sign(jwtEncoder, claims -> claims.issuer(JwtTestTokens.ISSUER)
+                .subject(String.valueOf(Long.MAX_VALUE)).issuedAt(now).expiresAt(now.plusSeconds(600)));
         long claimsBefore = expenseClaimRepository.count();
 
         mockMvc.perform(post("/api/claims")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(claimJson("MEALS", "20.00", LocalDate.now().minusDays(1), "Lunch")))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.detail").value("Employee " + Long.MAX_VALUE + " was not found"));
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.title").value("Authentication required"));
 
         mockMvc.perform(get("/api/claims/mine"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isUnauthorized());
 
         assertThat(expenseClaimRepository.count()).isEqualTo(claimsBefore);
     }
 
     @Test
     void signedOutCallerGets401() throws Exception {
-        currentEmployee.signOut();
+        signOut();
 
         mockMvc.perform(get("/api/claims/mine"))
                 .andExpect(status().isUnauthorized())
@@ -323,6 +352,15 @@ class ExpenseClaimControllerTest {
     }
 
     // ---- Helpers ----
+
+    // Issues a real signed token for the employee, exactly as a successful login would.
+    private void signInAs(Employee employee) {
+        bearerToken = jwtTokenService.issueToken(employee).value();
+    }
+
+    private void signOut() {
+        bearerToken = null;
+    }
 
     private Long submitClaim(String json) throws Exception {
         MvcResult result = mockMvc.perform(post("/api/claims").contentType(MediaType.APPLICATION_JSON).content(json))

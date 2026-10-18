@@ -4,6 +4,7 @@ import com.example.expenseclaims.security.AuthenticationRequiredException;
 import com.example.expenseclaims.service.ClaimNotFoundException;
 import com.example.expenseclaims.service.ClaimSubmissionNotAllowedException;
 import com.example.expenseclaims.service.EmployeeNotFoundException;
+import com.example.expenseclaims.service.InvalidCredentialsException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
@@ -11,6 +12,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -58,9 +61,27 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return problem(HttpStatus.NOT_FOUND, "Not found", ex.getMessage());
     }
 
-    @ExceptionHandler(AuthenticationRequiredException.class)
-    public ProblemDetail handleAuthenticationRequired(AuthenticationRequiredException ex) {
-        return problem(HttpStatus.UNAUTHORIZED, "Authentication required", ex.getMessage());
+    // Wrong email or wrong password: one generic answer for both.
+    @ExceptionHandler(InvalidCredentialsException.class)
+    public ProblemDetail handleInvalidCredentials(InvalidCredentialsException ex) {
+        return problem(HttpStatus.UNAUTHORIZED, "Authentication failed", "Invalid email or password.");
+    }
+
+    // Missing, malformed, expired or tampered token, or a token for an employee that no longer exists.
+    // Spring Security sends these here through SecurityProblemHandler. The detail is the same in every
+    // case, so a caller learns nothing about why their token was refused.
+    @ExceptionHandler({AuthenticationException.class, AuthenticationRequiredException.class})
+    public ResponseEntity<ProblemDetail> handleAuthenticationRequired(RuntimeException ex) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .header(HttpHeaders.WWW_AUTHENTICATE, "Bearer")
+                .body(problem(HttpStatus.UNAUTHORIZED, "Authentication required",
+                        "A valid bearer token is required."));
+    }
+
+    // Valid token, but the role may not do this (for example a manager submitting a claim).
+    @ExceptionHandler(AccessDeniedException.class)
+    public ProblemDetail handleAccessDenied(AccessDeniedException ex) {
+        return problem(HttpStatus.FORBIDDEN, "Not allowed", "You do not have permission to perform this action.");
     }
 
     @ExceptionHandler(ClaimSubmissionNotAllowedException.class)
