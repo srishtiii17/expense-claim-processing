@@ -56,7 +56,8 @@ public class ExpenseClaimService {
 
     /**
      * Returns one claim if it belongs to the given employee.
-     * Until Checkpoint 3 adds roles, only the owner can see a claim (managers and finance cannot yet).
+     * Only the owner can see a claim here. Department views for managers and finance reporting are
+     * planned for Checkpoint 5 (assumptions A2, A3, A10).
      */
     public ExpenseClaimResponse getClaim(Long employeeId, Long claimId) {
         ExpenseClaim claim = expenseClaimRepository.findById(claimId)

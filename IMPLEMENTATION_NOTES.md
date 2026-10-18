@@ -75,15 +75,17 @@ defaults are used (port 5432, PostgreSQL 18).
 | # | Assumption | Where it shows up in code |
 |---|---|---|
 | ~~A1~~ | Withdrawn. Replaced by C1 (single-stage approval); no code still uses it. | — |
-| A2 | Managers view their department's claims and approve or reject them (submission part superseded by C3) | Checkpoints 3–4 |
+| A2 | Managers approve or reject claims from their own department (**done, Checkpoint 4**) and view their department's claims (Checkpoint 5). Submission part superseded by C3 | `ClaimApprovalService` |
 | A3 | Finance can view claims across all departments (read-only, because of C1; exact finance powers still open) | Checkpoints 3–5 |
 | A4 | Expense date cannot be in the future; no maximum age. "Today" is the date in the **server's default time zone** (open question 5) | `@PastOrPresent` on `CreateExpenseClaimRequest.expenseDate` |
-| A5 | Rejection requires a comment; rejected claims are final; no resubmission in v1 | Checkpoint 4 |
+| A5 | Rejection requires a nonblank comment; approval comment optional; APPROVED and REJECTED are final; no resubmission or editing in v1 | `RejectClaimRequest`, `ClaimApprovalService` |
 | A6 | Monthly totals are grouped by `expense_date` for the current calendar month (the `APPROVED`-only part is confirmed by C2) | Checkpoint 5 |
 | A7 | Categories are a fixed list: TRAVEL, MEALS, ACCOMMODATION, OFFICE_SUPPLIES, TRAINING, OTHER | `ExpenseCategory` enum + DB CHECK |
 | A8 | Amount is stored as `NUMERIC(12,2)`; single currency; no upper limit | `ExpenseClaim.amount`, V1 migration |
 | A9 | Only the `EMPLOYEE` role submits claims. C3 rules out managers; finance users are assumed not to submit either | `ExpenseClaimService.submitClaim` |
-| A10 | Until Checkpoint 3 adds roles, a claim is visible only to its owner. Another employee's claim answers 404 (not 403), so claim ids cannot be probed | `ExpenseClaimService.getClaim` |
+| A10 | `GET /api/claims/{id}` shows a claim only to its owner. Another employee's claim answers 404 (not 403), so claim ids cannot be probed. The same 404 rule applies to a manager deciding a claim from another department | `ExpenseClaimService.getClaim`, `ClaimApprovalService` |
+| A11 | Nobody may approve or reject their own claim (possible only for a claim submitted before a promotion to manager) | `ClaimApprovalService` |
+| A12 | Any manager of the claim owner's department may decide it; there is no "assigned approver" or direct-report hierarchy (question 7) | `ClaimApprovalService` |
 
 ---
 
@@ -444,6 +446,111 @@ default password.
 
 ---
 
+## Checkpoint 4 — manager approval and rejection workflow
+
+### Summary (2026-10-18)
+
+Managers can approve or reject `SUBMITTED` claims from their own department. Each decision changes the
+claim's status and writes an `ApprovalComment` (the audit record) in the same transaction. Double or
+conflicting decisions answer 409, including two decisions racing each other.
+
+**No schema change and no new migration.** V1 already has everything needed: `expense_claims.version`
+(`@Version`), the status CHECK (`SUBMITTED`, `APPROVED`, `REJECTED`), `approval_comments` with
+`action` CHECK (`COMMENT`, `APPROVE`, `REJECT`), `author_id` and `claim_id` foreign keys, and nullable
+`comment_text VARCHAR(1000)`. No new dependencies.
+
+### Endpoints
+
+| Method and path | Body | Success |
+|---|---|---|
+| `POST /api/claims/{claimId}/approve` | optional: `{"comment": "Looks good"}` (≤ 1000 chars) | 200 `ClaimDecisionResponse` |
+| `POST /api/claims/{claimId}/reject` | required: `{"comment": "Receipt missing"}` (nonblank, ≤ 1000 chars) | 200 `ClaimDecisionResponse` |
+
+`ClaimDecisionResponse` = `{"claim": ExpenseClaimResponse, "decision": ApprovalCommentResponse}`; the
+decision shows `action`, `commentText`, `author` (id, name, department; no email) and `createdAt`.
+Comments are trimmed; a blank approval comment is stored as `NULL`.
+
+Errors, checked in this order:
+
+| Status | When |
+|---|---|
+| 401 | No or invalid token |
+| 403 | Caller is not `MANAGER` (security rule, before the body is read; the service checks again) |
+| 400 | Invalid body: reject without a nonblank comment, comment over 1000 characters, malformed JSON, non-numeric id |
+| 404 | Claim does not exist, **or** belongs to another department (same answer, so other departments' claim ids cannot be probed) |
+| 403 | The claim is the manager's own ("You cannot approve or reject your own expense claim") |
+| 409 | Claim is not `SUBMITTED` ("... is already APPROVED; only SUBMITTED claims can be approved or rejected") |
+| 409 | Another decision on the same claim committed first (optimistic locking): "The claim was changed by another request at the same time. Reload it and try again." |
+
+### State transitions
+
+```
+SUBMITTED --approve (MANAGER, same department, not own claim)--> APPROVED  (final)
+SUBMITTED --reject  (same, nonblank reason)--------------------> REJECTED  (final)
+```
+Any other transition is refused with 409 before anything is written. Manager approval is final (C1):
+there is no finance stage.
+
+### Authorization rules
+
+- **Role:** URL rule `POST /api/claims/*/approve` and `/reject` → `hasRole("MANAGER")` in `SecurityConfig`,
+  plus the same check in `ClaimApprovalService` (`ClaimDecisionNotAllowedException`) for non-HTTP callers.
+- **Department:** the claim owner's `department_id` must equal the manager's `department_id`. Both come
+  from the database; the manager is the employee in the verified JWT.
+- **Author:** the audit comment's author is always the logged-in manager. Request fields such as
+  `authorId`, `managerId`, `employeeId`, `status` or `action` are ignored (tested).
+
+### Atomicity and concurrency
+
+- `ClaimApprovalService.approveClaim/rejectClaim` are `@Transactional`. Inside one transaction:
+  1. load manager and claim, check role, department, ownership and status;
+  2. `saveAndFlush(claim)`: runs `UPDATE expense_claims ... WHERE id = ? AND version = ?` immediately;
+  3. `saveAndFlush(comment)`: inserts the audit comment.
+  If step 2 or 3 fails, the whole transaction rolls back: no status change and no comment
+  (tested by forcing step 3 to fail after step 2 ran).
+- **Optimistic locking (existing `@Version`):** two decisions may both read `SUBMITTED` (version 0), but
+  PostgreSQL makes the second `UPDATE` wait for the first, then it matches 0 rows because the version is
+  now 1. Hibernate raises an optimistic locking failure, the losing transaction rolls back (its comment
+  too) and `ApiExceptionHandler` answers 409 without internal details. If the requests do not overlap,
+  the loser sees the new status and gets the "already APPROVED/REJECTED" 409 instead.
+- Updating the claim before inserting the comment means a losing request never writes a comment first.
+- Clients do not send a version number (no `If-Match`). A manager who decides based on an old screen
+  still succeeds if the claim is still `SUBMITTED`; that is acceptable because nothing else can change a
+  submitted claim yet.
+
+### Tests added (20)
+
+| Class | Tests | Covers |
+|---|---|---|
+| `web.ClaimApprovalControllerTest` | 15 | Approve (with comment, trimmed; without body); reject with reason; reject without reason (`{}`, null, "", blank, no body) is 400; comments over 1000 chars are 400; employee and finance get 403; non-manager with invalid body still 403; no token 401; other department's manager 404; own claim 403; missing claim 404; client-chosen author/status ignored; double approval 409; approve after reject 409; reject after approve 409. Every refusal checks the claim is still unchanged (status, version) and no comment was written; every success checks the single audit comment's action, author and text |
+| `service.ClaimApprovalTransactionTest` | 4 | Committed transactions, not rolled back by the test. Rollback: comment insert forced to fail after the status `UPDATE` → status stays `SUBMITTED`, version 0, no comment, claim still decidable. Stale read: a decision based on an old version is refused by the version check. Race: 8 threads (2 managers, approve and reject) released together → exactly 1 success, 7 conflicts, 1 status change, 1 matching comment. Service-level role and reason checks. Deletes its own rows afterwards |
+| `web.ApiExceptionHandlerTest` | 1 | Optimistic locking failure → 409 with a generic message (no class names, ids or SQL) |
+
+The race test asserts the outcome (one winner), not which path each loser took: depending on timing,
+losers are stopped by the status check or by the version check. The stale-read test exercises the
+version check deterministically.
+
+### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6, `expense_claims_test`)
+
+`.\mvnw.cmd clean test`: **106 tests, 0 failures, 0 errors, 0 skipped — BUILD SUCCESS**
+(86 earlier + 15 + 4 + 1). Afterwards the test database had no leftover rows.
+
+### Not done yet
+
+- **Pending-approval list for managers** (claims of their department in `SUBMITTED`) and department
+  claim views: Checkpoint 5. A manager currently needs the claim id to decide it.
+- **Finance reporting** (monthly totals of `APPROVED` claims, C2): Checkpoint 5.
+- **Reading the audit trail through the API:** there is no endpoint yet for an employee to read the
+  rejection reason or for anyone to list a claim's comments. The decision response contains it, and it is
+  stored in `approval_comments`.
+- Plain comments (`CommentAction.COMMENT`) cannot be added through the API yet (question 4).
+- No resubmission or editing of rejected claims (A5).
+- No database-level "one decision per claim" constraint; it is enforced by the status check plus
+  optimistic locking. A partial unique index on `approval_comments(claim_id)` for `APPROVE`/`REJECT`
+  could be added in a new migration if the mentor wants a second safeguard.
+
+---
+
 ## Open mentor questions
 
 1. ~~Approval stages~~ answered by C1. Still open: finance's exact powers. Read-only reporting only, or anything else? (A3)
@@ -460,4 +567,7 @@ default password.
     directly in the database, 1-hour tokens, no refresh tokens.)
 13. Should finance users be able to submit their own expense claims? (Current assumption A9: no.)
 14. Should login emails be case-insensitive, and is login rate limiting or account lockout required?
+15. May any manager of a department decide its claims, or only an assigned approver (A12)? Should a
+    manager be able to undo a decision?
+16. Should approving require a comment too, or only rejecting (current: only rejecting)?
 12. Required base package name (currently `com.example.expenseclaims`)?

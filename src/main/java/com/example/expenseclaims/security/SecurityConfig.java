@@ -33,8 +33,9 @@ import java.util.Objects;
  * - Stateless: no HTTP session and no cookies. Every request must carry "Authorization: Bearer <token>".
  * - Public: only POST /api/auth/login (and Spring's internal /error page).
  * - Everything else requires a valid token. New routes are protected automatically.
- * - Role rule: only EMPLOYEE may submit claims (mentor clarification C3, assumption A9). This check
- *   runs in the security filter, before the request body is read or validated.
+ * - Role rules: only EMPLOYEE may submit claims (mentor clarification C3, assumption A9), and only
+ *   MANAGER may approve or reject them (Checkpoint 4). These checks run in the security filter,
+ *   before the request body is read or validated. The services check the same rules again.
  */
 @Configuration
 @EnableWebSecurity
@@ -54,6 +55,8 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers("/error").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/claims").hasRole("EMPLOYEE")
+                        .requestMatchers(HttpMethod.POST, "/api/claims/*/approve", "/api/claims/*/reject")
+                        .hasRole("MANAGER")
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(resourceServer -> resourceServer
                         .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter))

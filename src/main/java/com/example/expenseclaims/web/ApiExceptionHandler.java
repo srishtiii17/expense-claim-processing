@@ -1,12 +1,15 @@
 package com.example.expenseclaims.web;
 
 import com.example.expenseclaims.security.AuthenticationRequiredException;
+import com.example.expenseclaims.service.ClaimDecisionNotAllowedException;
 import com.example.expenseclaims.service.ClaimNotFoundException;
 import com.example.expenseclaims.service.ClaimSubmissionNotAllowedException;
 import com.example.expenseclaims.service.EmployeeNotFoundException;
+import com.example.expenseclaims.service.InvalidClaimStateException;
 import com.example.expenseclaims.service.InvalidCredentialsException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -84,9 +87,24 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return problem(HttpStatus.FORBIDDEN, "Not allowed", "You do not have permission to perform this action.");
     }
 
-    @ExceptionHandler(ClaimSubmissionNotAllowedException.class)
-    public ProblemDetail handleSubmissionNotAllowed(ClaimSubmissionNotAllowedException ex) {
+    @ExceptionHandler({ClaimSubmissionNotAllowedException.class, ClaimDecisionNotAllowedException.class})
+    public ProblemDetail handleNotAllowed(RuntimeException ex) {
         return problem(HttpStatus.FORBIDDEN, "Not allowed", ex.getMessage());
+    }
+
+    // The claim is not in a status that allows this change (for example, already approved).
+    @ExceptionHandler(InvalidClaimStateException.class)
+    public ProblemDetail handleInvalidClaimState(InvalidClaimStateException ex) {
+        return problem(HttpStatus.CONFLICT, "Conflict", ex.getMessage());
+    }
+
+    // Two requests changed the same claim at the same moment and this one lost (@Version check).
+    // Nothing from this request was saved; the client should reload the claim.
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ProblemDetail handleConcurrentUpdate(OptimisticLockingFailureException ex) {
+        log.info("Concurrent update rejected by optimistic locking");
+        return problem(HttpStatus.CONFLICT, "Conflict",
+                "The claim was changed by another request at the same time. Reload it and try again.");
     }
 
     // Anything unexpected (for example a database outage): log the details on the server,
