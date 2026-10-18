@@ -57,7 +57,7 @@ defaults are used (port 5432, PostgreSQL 18).
 |---|---|---|---|
 | C1 | **Manager approval is the final approval.** A claim goes `SUBMITTED → APPROVED` or `SUBMITTED → REJECTED`, decided by the manager. There is no second (finance) approval stage. | A1 | **Done (2026-10-16):** `ClaimStatus` now has only `SUBMITTED`, `APPROVED`, `REJECTED` (Javadoc updated); the `ck_expense_claims_status` CHECK in `V1__create_initial_tables.sql` allows only those three values; `ExpenseClaimRepositoryTest.versionIncreasesWhenClaimIsUpdated` uses `APPROVED`. V1 was edited in place because it had never been applied to any database (every connection attempt failed authentication), so there is no Flyway checksum conflict. |
 | C2 | **Monthly totals include `APPROVED` claims only.** | Confirms the status part of A6 | None; matches A6. |
-| C3 | **Managers do not need to submit their own claims.** | A2 (submission part); resolves open question 3 | No code yet. Claim submission (Checkpoint 2/3) should be limited to the `EMPLOYEE` role, so a manager never approves their own claim. |
+| C3 | **Managers do not need to submit their own claims.** | A2 (submission part); resolves open question 3 | **Done (Checkpoint 2 part 2):** `ExpenseClaimService.submitClaim` allows only the `EMPLOYEE` role; `MANAGER` (and `FINANCE`, see A9) get HTTP 403. |
 
 ## Business-rule assumptions (not yet confirmed by mentor)
 
@@ -71,6 +71,8 @@ defaults are used (port 5432, PostgreSQL 18).
 | A6 | Monthly totals are grouped by `expense_date` for the current calendar month (the `APPROVED`-only part is confirmed by C2) | Checkpoint 5 |
 | A7 | Categories are a fixed list: TRAVEL, MEALS, ACCOMMODATION, OFFICE_SUPPLIES, TRAINING, OTHER | `ExpenseCategory` enum + DB CHECK |
 | A8 | Amount is stored as `NUMERIC(12,2)`; single currency; no upper limit | `ExpenseClaim.amount`, V1 migration |
+| A9 | Only the `EMPLOYEE` role submits claims. C3 rules out managers; finance users are assumed not to submit either | `ExpenseClaimService.submitClaim` |
+| A10 | Until Checkpoint 3 adds roles, a claim is visible only to its owner. Another employee's claim answers 404 (not 403), so claim ids cannot be probed | `ExpenseClaimService.getClaim` |
 
 ---
 
@@ -190,9 +192,8 @@ Not covered by a test: there is no test that tries to insert a removed or invali
   database). It uses a fixed clock (2026-10-18, UTC) so the future-date test cannot fail by chance
   at midnight.
 
-**Not done yet:** nothing calls the validator outside the tests. The annotations take effect once a
-controller method receives the request with `@Valid` (next Checkpoint 2 step), together with an
-error handler that turns violations into a clear 400 response.
+**Update (part 2):** `ExpenseClaimController` now receives the request with `@Valid`, and
+`ApiExceptionHandler` turns violations into an HTTP 400 response.
 
 ### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6)
 
@@ -212,6 +213,84 @@ Full suite (`.\mvnw.cmd test`): **26 tests, 0 failures, 0 errors, 0 skipped — 
   `.\mvnw.cmd clean test`.
 - `@Size` counts Java `char`s, so an emoji counts as 2 while PostgreSQL counts it as 1. Java is
   therefore slightly stricter than the column, never looser.
+
+---
+
+## Checkpoint 2 (part 2) — claim submission and retrieval
+
+### Authentication status — read this first
+
+**Authentication and authorization are NOT implemented. They are scheduled for Checkpoint 3.**
+The production application has no login, so it cannot know who is calling. Instead of trusting an
+employee id sent by the caller, every claim endpoint currently answers **HTTP 401** in the running
+application. The endpoints are fully exercised by tests, which supply an identity from test-only code.
+
+### What was implemented (2026-10-18)
+
+| Layer | Class | Responsibility |
+|---|---|---|
+| Identity boundary | `security.CurrentEmployeeProvider` (interface) | "Which employee is calling?" The only place the app learns the caller's identity |
+| | `security.UnauthenticatedCurrentEmployeeProvider` (`@Component`) | Production implementation until Checkpoint 3: always throws `AuthenticationRequiredException` (401) |
+| | `security.AuthenticationRequiredException` | Mapped to 401 |
+| Service | `service.ExpenseClaimService` | Submit (role check, save as `SUBMITTED`), get one claim, list own claims. `@Transactional(readOnly = true)` by default, `@Transactional` for submit. Builds DTOs inside the transaction (lazy loading, open-in-view off) |
+| | `service.ClaimNotFoundException`, `EmployeeNotFoundException`, `ClaimSubmissionNotAllowedException` | Expected failures, mapped to 404 / 404 / 403 |
+| Web | `web.ExpenseClaimController` | HTTP only: resolves the caller through `CurrentEmployeeProvider`, calls the service, sets status codes |
+| | `web.ApiExceptionHandler` (`@RestControllerAdvice`) | The only exception handler. Returns RFC 9457 problem details (`application/problem+json`) |
+| Repository | `ExpenseClaimRepository.findByEmployeeIdOrderByCreatedAtDescIdDesc` | "My claims", newest first (uses `idx_expense_claims_employee_id`) |
+
+No schema change and no new migration: V1 already had every column needed.
+No new dependencies: validation, Spring MVC, Jackson and MockMvc were already on the classpath.
+
+### API
+
+| Method and path | Success | Errors |
+|---|---|---|
+| `POST /api/claims` | 201 Created, `Location: /api/claims/{id}`, body `ExpenseClaimResponse` | 400 invalid body; 401 no identity; 403 caller is not `EMPLOYEE`; 404 caller's employee record missing |
+| `GET /api/claims/mine` | 200, array of `ExpenseClaimResponse`, newest first (empty array if none) | 401; 404 employee missing |
+| `GET /api/claims/{claimId}` | 200, `ExpenseClaimResponse` | 400 non-numeric id; 401; 404 missing **or** not the caller's claim |
+
+### Design decisions
+
+- **The service takes the employee id as a parameter.** It does not know about HTTP or login, so
+  Checkpoint 3 only needs a new `CurrentEmployeeProvider` (for example one that reads the JWT
+  subject); controller and service stay unchanged.
+- **The owner is never taken from the request.** `CreateExpenseClaimRequest` has no owner or status
+  field. Extra JSON properties such as `employeeId` or `status` are ignored (tested).
+- **Test identity lives only in `src/test`.** `TestCurrentEmployeeProvider` is not a `@Component`;
+  tests opt in with `@Import(TestAuthenticationConfiguration.class)`, which registers it as `@Primary`.
+  There is no header, profile or flag in production code that switches identity on.
+- **404 for other people's claims**, so a caller cannot tell "does not exist" from "not yours" (A10).
+- **Amounts are normalised to 2 decimal places** (`setScale(2)`, which never rounds because `@Digits`
+  already limits the scale), so a response shows `125.50` exactly as stored.
+- **Errors never contain stack traces, class names or SQL.** Unexpected exceptions are logged on the
+  server and answered with a generic 500.
+
+### Tests added
+
+| Class | Tests | Covers |
+|---|---|---|
+| `web.ExpenseClaimControllerTest` | 17 | 201 + Location + `SUBMITTED`; row saved in PostgreSQL for the caller; extra `employeeId`/`status` ignored; no email/password/version in responses; manager gets 403; invalid fields (400 with per-field messages, nothing saved); too many decimals; unknown category, malformed JSON and non-numeric id (400 without internal details); read own claim; "mine" filtered and newest first; empty list; missing claim 404; other employee's claim 404; missing employee 404 and nothing saved; signed-out 401 |
+| `web.ExpenseClaimControllerWithoutAuthenticationTest` | 2 | Production provider: submit and read answer 401, and nothing is saved even when the body contains `employeeId` |
+| `repository.ExpenseClaimRepositoryTest` | +1 | New query returns only that employee's claims, newest first |
+
+All tests use the `test` profile and `expense_claims_test`, and roll back their data.
+
+### Test results (2026-10-18, JDK 25.0.4.1, PostgreSQL 18.6)
+
+`.\mvnw.cmd clean test`: **46 tests, 0 failures, 0 errors, 0 skipped — BUILD SUCCESS**
+(26 earlier + 17 controller + 2 unauthenticated + 1 repository).
+
+### Remaining limitations
+
+- **No authentication or authorization (Checkpoint 3).** In the running application every claim
+  endpoint answers 401.
+- Managers and finance cannot view other employees' claims yet (A2, A3, A10). Approval is Checkpoint 4.
+- Validation runs before the identity check, so an unauthenticated request with an invalid body gets
+  400, not 401. Spring Security (Checkpoint 3) checks identity first, which will fix this order.
+- `EmployeeNotFoundException` answers 404. Once tokens exist, a token for a deleted employee may be
+  better answered with 401; decide in Checkpoint 3.
+- "My claims" has no paging or filtering yet.
+- MockMvc exercises the full Spring MVC stack without starting a real HTTP server.
 
 ---
 

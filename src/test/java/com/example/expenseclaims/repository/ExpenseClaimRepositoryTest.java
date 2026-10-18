@@ -82,6 +82,23 @@ class ExpenseClaimRepositoryTest {
     }
 
     @Test
+    void findByEmployeeIdReturnsOnlyThatEmployeesClaimsNewestFirst() {
+        Employee other = entityManager.persist(
+                new Employee("Other Person", "other@example.com", "hash", Role.EMPLOYEE, employee.getDepartment()));
+        ExpenseClaim older = expenseClaimRepository.saveAndFlush(new ExpenseClaim(employee, ExpenseCategory.MEALS,
+                new BigDecimal("20.00"), LocalDate.of(2026, 9, 10), "Lunch"));
+        ExpenseClaim newer = expenseClaimRepository.saveAndFlush(new ExpenseClaim(employee, ExpenseCategory.TRAVEL,
+                new BigDecimal("35.00"), LocalDate.of(2026, 9, 11), "Train"));
+        expenseClaimRepository.saveAndFlush(new ExpenseClaim(other, ExpenseCategory.OTHER,
+                new BigDecimal("5.00"), LocalDate.of(2026, 9, 12), "Not Ravi's"));
+        entityManager.clear();
+
+        List<ExpenseClaim> claims = expenseClaimRepository.findByEmployeeIdOrderByCreatedAtDescIdDesc(employee.getId());
+
+        assertThat(claims).extracting(ExpenseClaim::getId).containsExactly(newer.getId(), older.getId());
+    }
+
+    @Test
     void versionIncreasesWhenClaimIsUpdated() {
         ExpenseClaim claim = expenseClaimRepository.saveAndFlush(new ExpenseClaim(employee, ExpenseCategory.OTHER,
                 new BigDecimal("10.00"), LocalDate.of(2026, 10, 2), null));
